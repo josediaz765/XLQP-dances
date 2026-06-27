@@ -1,0 +1,298 @@
+
+if getgenv().Animator6DController then
+warn("[Animator6D] Controller already running")
+return
+end
+getgenv().Animator6DController = true
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+local character
+local hum
+
+
+local function StopCurrent()
+if getgenv().currentAnimator6D then
+pcall(function()
+getgenv().currentAnimator6D:Stop(true)
+end)
+getgenv().currentAnimator6D = nil
+end
+end
+
+local function BindCharacter(char)
+character = char
+hum = char:WaitForChild("Humanoid")
+
+
+getgenv().Animator6DCharacter = char
+
+StopCurrent()
+
+hum.Died:Connect(function()
+    StopCurrent()
+end)
+
+warn("[Animator6D] Bound to new character")
+
+
+end
+
+
+BindCharacter(player.Character or player.CharacterAdded:Wait())
+
+
+player.CharacterAdded:Connect(function(char)
+task.wait(0.25)
+BindCharacter(char)
+end)
+
+
+
+local LocalAssetCache = {}
+local fullModel
+
+pcall(function()
+fullModel = game:GetObjects("rbxassetid://107495486817639")[1]
+if fullModel then
+fullModel.Parent = workspace
+end
+end)
+
+local function LoadLocalAsset(id)
+id = tostring(id):gsub("^rbxassetid://","")
+
+
+if LocalAssetCache[id] then
+    return LocalAssetCache[id]
+end
+
+local found = fullModel and fullModel:FindFirstChild(id,true)
+if found then
+    LocalAssetCache[id] = found
+    return found
+end
+
+local ok,obj = pcall(function()
+    return game:GetObjects("rbxassetid://"..id)[1]
+end)
+
+if ok and obj then
+    LocalAssetCache[id] = obj
+    return obj
+end
+
+warn("[Animator6D] Failed to load:",id)
+return nil
+
+
+end
+
+
+
+local R6Map = {
+["Head"] = "Neck",
+["Torso"] = "RootJoint",
+["Right Arm"] = "Right Shoulder",
+["Left Arm"] = "Left Shoulder",
+["Right Leg"] = "Right Hip",
+["Left Leg"] = "Left Hip"
+}
+
+
+
+local function ConvertToTable(kfs)
+if not (kfs and kfs:IsA("KeyframeSequence")) then
+for _,obj in ipairs(kfs:GetDescendants()) do
+if obj:IsA("KeyframeSequence") then
+kfs = obj
+break
+end
+end
+end
+
+
+local seq = {}
+for _,frame in ipairs(kfs:GetKeyframes()) do
+    local entry = {Time=frame.Time,Data={}}
+    for _,pose in ipairs(frame:GetDescendants()) do
+        if pose:IsA("Pose") and pose.Weight>0 then
+            entry.Data[pose.Name]={CFrame=pose.CFrame}
+        end
+    end
+    table.insert(seq,entry)
+end
+
+table.sort(seq,function(a,b)return a.Time<b.Time end)
+return seq,kfs.Loop
+
+
+end
+
+
+
+local function BuildMotorMap(rig)
+local map,lower={},{}
+for _,m in ipairs(rig:GetDescendants()) do
+if m:IsA("Motor6D") then
+map[m.Name]=m
+lower[string.lower(m.Name)]=m
+end
+end
+return map,lower
+end
+
+local function FindMotor(poseName,map,lower)
+local match=R6Map[poseName] or poseName
+return map[match] or lower[string.lower(match)]
+end
+
+
+local AnimPlayer={}
+AnimPlayer.__index=AnimPlayer
+
+function AnimPlayer.new(rig,kfs)
+local self=setmetatable({},AnimPlayer)
+self.rig=rig
+self.seq,self.looped=ConvertToTable(kfs)
+self.map,self.lower=BuildMotorMap(rig)
+self.time=0
+self.playing=false
+self.length=self.seq[#self.seq].Time
+self.speed=1
+self.savedC0={}
+
+
+for _,m in pairs(self.map) do
+    self.savedC0[m]=m.C0
+end
+return self
+
+
+end
+
+function AnimPlayer:Play(speed,loop)
+if self.playing then return end
+self.playing=true
+self.speed=speed or 1
+self.looped=(loop==nil) and true or loop
+
+
+self.conn=RunService.Heartbeat:Connect(function(dt)
+    if not self.playing then return end
+    self.time+=dt*self.speed
+
+    if self.time>self.length then
+        if self.looped then
+            self.time-=self.length
+        else
+            self:Stop(true)
+            return
+        end
+    end
+
+    local prev=self.seq[1]
+    for i=1,#self.seq do
+        if self.seq[i].Time<=self.time then
+            prev=self.seq[i]
+        else break end
+    end
+
+    for joint,data in pairs(prev.Data) do
+        local motor=FindMotor(joint,self.map,self.lower)
+        if motor then
+            pcall(function()
+                motor.C0=self.savedC0[motor]*data.CFrame
+            end)
+        end
+    end
+end)
+
+
+end
+
+function AnimPlayer:Stop(restore)
+self.playing=false
+if self.conn then self.conn:Disconnect() end
+
+
+if restore then
+    for motor,orig in pairs(self.savedC0) do
+        pcall(function() motor.C0=orig end)
+    end
+end
+
+
+end
+
+
+
+local function disableDefaultAnimations(char)
+local humanoid=char:FindFirstChildOfClass("Humanoid")
+if not humanoid then return end
+
+
+for _,track in ipairs(humanoid:GetPlayingAnimationTracks()) do
+    track:Stop(0)
+end
+
+local animate=char:FindFirstChild("Animate")
+if animate then animate.Disabled=true end
+
+local animator=humanoid:FindFirstChildOfClass("Animator")
+if animator then animator:Destroy() end
+
+
+end
+
+
+
+getgenv().Animator6D=function(idOrInstance,speed,looped)
+local kfs
+
+
+if typeof(idOrInstance)=="Instance" then
+    kfs=idOrInstance:IsA("KeyframeSequence") and idOrInstance
+        or idOrInstance:FindFirstChildOfClass("KeyframeSequence")
+else
+    local asset=LoadLocalAsset(idOrInstance)
+    if asset then
+        kfs=asset:FindFirstChildOfClass("KeyframeSequence") or asset
+    end
+end
+
+if not kfs then
+    warn("[Animator6D] Failed to load animation:",idOrInstance)
+    return
+end
+
+local rig=getgenv().Animator6DCharacter or character
+if not rig then return end
+
+disableDefaultAnimations(rig)
+StopCurrent()
+
+local anim=AnimPlayer.new(rig,kfs)
+getgenv().currentAnimator6D=anim
+anim:Play(speed or 1,looped)
+
+
+end
+
+getgenv().Animator6DStop=function()
+StopCurrent()
+end
+
+
+
+
+
+pcall(function()
+game:GetService("StarterGui"):SetCore("SendNotification",{
+Title="anim6d loadedzzzz",
+Text="pers ",
+Duration=5
+})
+end)
